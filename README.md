@@ -125,3 +125,5 @@ Desenvolvedor Full Stack e entusiasta de análise de dados, machine learning e s
 ## 📄 Licença
 
 Este projeto é de caráter educacional e analítico. Os dados utilizados são de fontes públicas.
+
+Obrigado!
