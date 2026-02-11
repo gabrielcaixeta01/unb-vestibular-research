@@ -1,78 +1,157 @@
 import re
+import bisect
 import pandas as pd
+from pathlib import Path
+import pdfplumber
 
-def to_float_or_none(s):
-    s = s.strip()
+
+# -----------------------------
+# Conversores robustos
+# -----------------------------
+def to_float_or_none(s: str):
+    s = (s or "").strip()
     if s in {"-", ""}:
         return None
+    # normaliza negativos que vêm como "- 24.035"
+    s = re.sub(r"^\-\s+", "-", s)
+    # menos unicode
+    s = s.replace("−", "-")
+    # remove espaços internos
+    s = s.replace(" ", "")
     return float(s)
 
-def to_int_or_none(s):
-    s = s.strip()
+
+def to_int_or_none(s: str):
+    s = (s or "").strip()
     if s in {"-", ""}:
         return None
+    s = s.replace("−", "-").replace(" ", "")
     return int(s)
 
-# Heurísticas de cabeçalho de curso (ajuste se necessário)
-COURSE_HINTS = [
-    r"\((?:BACHARELADO|LICENCIATURA)\)",  # muito comum em editais
-    r"\bENGENHARIA\b",
-    r"\bCI[ÊE]NCIA\b",
-    r"\bMEDICINA\b",
-    r"\bDIREITO\b",
-]
 
-def extract_last_course_header(gap_text: str):
+# -----------------------------
+# Regex (ancoradas em linha)
+# -----------------------------
+# Ex: "1.1.1 CAMPUS DARCY RIBEIRO – DIURNO"
+CAMPUS_TURNO_LINE_RX = re.compile(
+    r"(?m)^\s*(?:\d+(?:\.\d+)*\s+)?CAMPUS\s+(.+?)\s*[-–—]\s*(DIURNO|NOTURNO|MATUTINO|VESPERTINO|INTEGRAL)\s*$",
+    flags=re.IGNORECASE
+)
+
+# Ex: "ADMINISTRAÇÃO (BACHARELADO)"
+COURSE_LINE_RX = re.compile(
+    r"(?m)^\s*([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-–—/\.]{2,}?)\s*\((BACHARELADO|LICENCIATURA)\)\s*$"
+)
+
+# Aluno: inscrição de 8 dígitos até a próxima inscrição ou fim
+STUDENT_RX = re.compile(r"(?m)(\d{8},.*?)(?=\s*\d{8},|$)")
+
+
+def normalize_text_keep_lines(text: str) -> str:
+    # mantém \n para regex de linha funcionar, mas normaliza espaços demais
+    t = text.replace("\u00ad", "").replace("−", "-")
+    # normaliza espaços dentro de cada linha, preservando quebras
+    t = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in t.splitlines())
+    return t
+
+
+# -----------------------------
+# Extração de texto do PDF
+# -----------------------------
+def extract_text_from_pdf(pdf_path: Path) -> str:
+    pages_text = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            # fallback: às vezes extract_text vem ruim
+            if len(txt.strip()) < 30:
+                words = page.extract_words(use_text_flow=True) or []
+                txt = " ".join(w["text"] for w in words)
+            pages_text.append(txt)
+    return "\n".join(pages_text)
+
+
+# -----------------------------
+# Construir "linha do tempo" de cabeçalhos
+# -----------------------------
+def build_header_timeline(text: str):
     """
-    Tenta achar a ÚLTIMA linha/título de curso dentro do trecho entre alunos.
-    Como o PDF vira um texto 'achatado', aqui buscamos padrões típicos.
+    Retorna uma lista ordenada de eventos:
+    (posicao_no_texto, campus, turno, curso)
+    onde cada evento representa o "estado" a partir daquele ponto.
     """
-    g = re.sub(r"\s+", " ", gap_text).strip()
+    events = []
 
-    # tenta achar algo com (BACHARELADO|LICENCIATURA) e pegar a "frase" ao redor
-    m = None
-    for pat in COURSE_HINTS:
-        # pega até ~120 chars antes e depois do hint (ajustável)
-        rx = re.compile(rf"(.{{0,120}}{pat}.{{0,120}})", re.IGNORECASE)
-        for mm in rx.finditer(g):
-            m = mm  # fica com o último encontrado
+    # campus/turno
+    for m in CAMPUS_TURNO_LINE_RX.finditer(text):
+        campus = m.group(1).strip(" -–—:;,.").upper()
+        turno = m.group(2).strip().upper()
+        events.append((m.start(), ("campus", campus, turno)))
 
-    if not m:
-        return None
+    # curso
+    for m in COURSE_LINE_RX.finditer(text):
+        curso_nome = m.group(1).strip(" -–—:;,.")
+        tipo = m.group(2).strip().upper()  # não usamos no CSV, mas poderia guardar
+        # guarda apenas o nome do curso
+        events.append((m.start(), ("curso", curso_nome, tipo)))
 
-    candidate = m.group(1).strip(" -–—:;,.")
-    # limpeza leve
-    candidate = re.sub(r"\s{2,}", " ", candidate)
-    return candidate
+    # ordena por posição
+    events.sort(key=lambda x: x[0])
 
-def parse_unb_with_course(texto: str) -> pd.DataFrame:
-    t = re.sub(r"\s+", " ", texto).strip()
+    # caminha e cria estados
+    timeline = []
+    campus = None
+    turno = None
+    curso = None
 
-    # cada aluno: do "8 dígitos," até a próxima inscrição ou fim
-    student_rx = re.compile(r"(?m)(\d{8},.*?)(?=\s*\d{8},|$)")
+    for pos, ev in events:
+        if ev[0] == "campus":
+            campus, turno = ev[1], ev[2]
+        else:
+            curso = ev[1]  # nome do curso
+        timeline.append((pos, campus, turno, curso))
+
+    # garante pelo menos um estado inicial
+    if not timeline:
+        timeline = [(0, None, None, None)]
+
+    return timeline
+
+
+def get_state_for_position(timeline, pos: int):
+    """
+    Pega o último estado cujo start_pos <= pos.
+    """
+    starts = [t[0] for t in timeline]
+    idx = bisect.bisect_right(starts, pos) - 1
+    idx = max(idx, 0)
+    _, campus, turno, curso = timeline[idx]
+    return campus, turno, curso
+
+
+# -----------------------------
+# Parser principal
+# -----------------------------
+def parse_unb(texto: str) -> pd.DataFrame:
+    t = normalize_text_keep_lines(texto)
+    timeline = build_header_timeline(t)
 
     rows = []
-    curso_atual = None
-    last_end = 0
 
-    for m in student_rx.finditer(t):
-        start, end = m.start(1), m.end(1)
+    for m in STUDENT_RX.finditer(t):
+        bloco = m.group(1).strip(" ,/ \n")
+        start_pos = m.start(1)
 
-        # trecho entre o fim do último aluno e o início do atual
-        gap = t[last_end:start]
-        novo_curso = extract_last_course_header(gap)
-        if novo_curso:
-            curso_atual = novo_curso
-
-        bloco = m.group(1).strip(" ,/")
+        campus, turno, curso = get_state_for_position(timeline, start_pos)
 
         parts = [p.strip() for p in bloco.split(",")]
         if len(parts) < 7:
-            last_end = end
             continue
 
         row = {
-            "curso": curso_atual,
+            "campus": campus,
+            "turno": turno,
+            "curso": curso,
             "inscricao": parts[0],
             "nome": parts[1],
             "nota_CI": to_float_or_none(parts[2]),
@@ -83,8 +162,30 @@ def parse_unb_with_course(texto: str) -> pd.DataFrame:
             "class_universal": to_int_or_none(parts[7]) if len(parts) > 7 else None,
             "classificacoes_raw": parts[8:] if len(parts) > 8 else [],
         }
-
         rows.append(row)
-        last_end = end
 
     return pd.DataFrame(rows)
+
+
+def generate_csv_from_pdf(pdf_path: Path, output_csv: Path, ano: int):
+    raw_text = extract_text_from_pdf(pdf_path)
+    df = parse_unb(raw_text)
+
+    df.insert(0, "ano", ano)
+    df["inscricao"] = df["inscricao"].astype(str)
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # Excel PT-BR friendly
+    df.to_csv(output_csv, index=False, sep=";", encoding="utf-8-sig")
+
+    # resumo pra validar
+    print("[OK] CSV:", output_csv)
+    print("Linhas:", len(df))
+    print("Cursos (amostra):", df["curso"].dropna().unique()[:10])
+
+
+if __name__ == "__main__":
+    pdf_path = Path("data/raw/vest2026.pdf")
+    output_csv = Path("data/processed/vest2026.csv")
+    generate_csv_from_pdf(pdf_path, output_csv, ano=2026)
