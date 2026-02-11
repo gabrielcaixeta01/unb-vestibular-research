@@ -50,6 +50,8 @@ STUDENT_RX = re.compile(r"(?m)(\d{8},.*?)(?=\s*\d{8},|$)")
 def normalize_text_keep_lines(text: str) -> str:
     # mantém \n para regex de linha funcionar, mas normaliza espaços demais
     t = text.replace("\u00ad", "").replace("−", "-")
+    # separa registros que vêm como " / "
+    t = re.sub(r"\s*/\s*", "\n", t)
     # normaliza espaços dentro de cada linha, preservando quebras
     t = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in t.splitlines())
     return t
@@ -62,7 +64,8 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
     pages_text = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            txt = page.extract_text() or ""
+            # tenta preservar layout/colunas
+            txt = page.extract_text(layout=True, x_tolerance=1, y_tolerance=1) or ""
             # fallback: às vezes extract_text vem ruim
             if len(txt.strip()) < 30:
                 words = page.extract_words(use_text_flow=True) or []
@@ -186,6 +189,6 @@ def generate_csv_from_pdf(pdf_path: Path, output_csv: Path, ano: int):
 
 
 if __name__ == "__main__":
-    pdf_path = Path("data/raw/vest2026.pdf")
-    output_csv = Path("data/processed/vest2026.csv")
-    generate_csv_from_pdf(pdf_path, output_csv, ano=2026)
+    pdf_path = Path("data/raw/vest2023.pdf")
+    output_csv = Path("data/processed/vest2023.csv")
+    generate_csv_from_pdf(pdf_path, output_csv, ano=2023)
